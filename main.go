@@ -1,11 +1,3 @@
-// const (
-// 	senderEmail   = "MS_YNKJNo@trial-neqvygm85w840p7w.mlsender.net"
-// 	receiverEmail = "msaruni679@gmail.com"
-// 	smtpServer    = "smtp.mailersend.net"
-// 	smtpPort      = "587"
-// 	smtpPassword  = "IY7lWUfg260dD6hR"
-// )
-
 package main
 
 import (
@@ -22,41 +14,126 @@ import (
 	"net/smtp"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/jung-kurt/gofpdf"
 	"github.com/skip2/go-qrcode"
+	"github.com/supabase-community/supabase-go"
 )
 
 type GenerateQRRequest struct {
 	Email          string `json:"email"`
 	EventID        string `json:"event_id"`
 	TicketQuantity int    `json:"ticket_quantity"`
+	Venue          string `json:"venue"`
+	Date           string `json:"date"`
+	Event_name     string `json:"event_name"`
+	User_name      string `json:"user_name"`
+}
+
+// Supabase client as global for reuse
+var supabaseClient *supabase.Client
+
+func init() {
+	// Load environment variables
+	// err := godotenv.Load(".env")
+	// if err != nil {
+	// 	log.Fatalf("Error loading .env file: %v", err)
+	// }
+
+	// Initialize Supabase client once
+	supabaseUrl := os.Getenv("SUPABASE_URL")
+	supabaseAnonKey := os.Getenv("SUPABASE_ANON_KEY")
+	if supabaseUrl == "" || supabaseAnonKey == "" {
+		log.Fatalf("supabase URL or anon key not set")
+	}
+	client, err := supabase.NewClient(supabaseUrl, supabaseAnonKey, &supabase.ClientOptions{})
+	if err != nil {
+		log.Fatalf("Error initializing Supabase client: %v", err)
+	}
+	supabaseClient = client
 }
 
 func main() {
 	http.HandleFunc("/generate-qr", handleGenerateQR)
 	fmt.Println("Starting HTTP server on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8080", nil)) // Go handles requests concurrently by default
+}
+
+func addTicketData(event_id, transaction_id, ticketCode string) error {
+	// Prepare ticket data for insertion
+	ticketData := map[string]interface{}{
+		"ticket_id":      ticketCode,
+		"transaction_id": transaction_id,
+		"scanned":        false,
+		"event_id":       event_id,
+	}
+
+	// Insert the ticket data into the "TICKETS" table
+	_, _, err := supabaseClient.From("TICKETS").Insert(ticketData, false, "", "*", "").Execute()
+	if err != nil {
+		log.Printf("Detailed Supabase client error: %v", err)
+		return fmt.Errorf("error adding ticket data: %w", err)
+	}
+	return nil
+}
+
+func addTransactionData(code string, quantity int, email string) error {
+	// Prepare transaction data for insertion
+	transactionData := map[string]interface{}{
+		"transaction_id": code,
+		"purchased_by":   email,
+		"quantity":       quantity,
+		"delivered":      true,
+	}
+
+	// Insert the transaction data into the "TRANSACTIONS" table
+	_, _, err := supabaseClient.From("TRANSACTIONS").Insert(transactionData, false, "", "*", "").Execute()
+	if err != nil {
+		log.Printf("Detailed Supabase client error: %v", err)
+		return fmt.Errorf("error adding transaction data: %w", err)
+	}
+	return nil
 }
 
 func handleGenerateQR(w http.ResponseWriter, r *http.Request) {
+	// Allow cross-origin requests
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	// Handle preflight request (OPTIONS)
+	if r.Method == http.MethodOptions {
+		return
+	}
+
 	var req GenerateQRRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
-	// Generate QR codes and send them as separate PDFs
-	attachments, err := generateSeparatePDFs(req.Email, req.EventID, req.TicketQuantity)
-	if err != nil {
-		http.Error(w, "Error generating PDFs", http.StatusInternalServerError)
-		return
-	}
+	// Process the request concurrently using a goroutine
+	errorChan := make(chan error, 1)
+	go func() {
+		attachments, err := generateSeparatePDFs(req.Email, req.Event_name, req.EventID, req.TicketQuantity, req.Venue, req.Date)
+		if err != nil {
+			errorChan <- fmt.Errorf("error generating PDFs: %w", err)
+			return
+		}
 
-	// Send the email with the PDFs attached
-	if err := sendEmailWithAttachments(req.Email, "QR Codes for Event "+req.EventID, "Attached are your QR codes for the event", attachments); err != nil {
-		http.Error(w, "Error sending email", http.StatusInternalServerError)
+		if err := sendEmailWithAttachments(req.Email, "Your tickets are here! ", "Hey "+req.User_name+" ! \n"+"Here's your ticket for "+req.Event_name+"\n Enjoy!", attachments); err != nil {
+			errorChan <- fmt.Errorf("error sending email: %w", err)
+			return
+		}
+
+		errorChan <- nil // No error, operation successful
+	}()
+
+	// Wait for goroutine to complete
+	if err := <-errorChan; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -64,119 +141,120 @@ func handleGenerateQR(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("QR codes generated and emailed successfully!"))
 }
 
-func generateSeparatePDFs(email, eventID string, ticketQuantity int) ([]string, error) {
-	var attachments []string
+func generateSeparatePDFs(email, eventName string, eventID string, ticketQuantity int, venue string, date string) ([]string, error) {
+	var wg sync.WaitGroup
+	attachments := make([]string, 0, ticketQuantity)
 
-	qrData := fmt.Sprintf("%s%d%s%d", eventID, ticketQuantity, email, time.Now().Unix())
-	// Hash the data
 	hash := sha256.New()
-	hash.Write([]byte(qrData))
-	// Convert the hash to a string
+	hash.Write([]byte(fmt.Sprintf("%s%d%s%d", eventID, ticketQuantity, email, time.Now().Unix())))
 	hashStr := hex.EncodeToString(hash.Sum(nil))
 
-	for i := 1; i <= ticketQuantity; i++ {
-		pdf := gofpdf.New("P", "mm", "A4", "")
-		//  ADD hash function here
-		url := fmt.Sprintf("%s-%d", hashStr, i) //URL should be the result if the hash function
-		addQRCodeToPDF(pdf, i, url, email, eventID)
-
-		fileName := fmt.Sprintf("%s_ticket_%d.pdf", eventID, i)
-		if err := pdf.OutputFileAndClose(fileName); err != nil {
-			fmt.Println("Error creating PDF:", err)
-			return nil, err
-		}
-		attachments = append(attachments, fileName)
+	// Insert transaction data once, before starting the PDF generation
+	if err := addTransactionData(hashStr, ticketQuantity, email); err != nil {
+		return nil, fmt.Errorf("error adding transaction data: %w", err)
 	}
+
+	// Generate PDFs concurrently
+	for i := 1; i <= ticketQuantity; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			pdf := gofpdf.New("P", "mm", "A4", "")
+			url := fmt.Sprintf("%s-%d", hashStr, i)
+			addQRCodeToPDF(pdf, i, url, email, eventName, venue, date)
+
+			// Specifying output directory for PDFs#
+			outPutDir := "/src/output"
+			fileName := fmt.Sprintf("%s_ticket_%d.pdf", eventID, i)
+			fullPath := filepath.Join(outPutDir, fileName)
+
+			if err := pdf.OutputFileAndClose(fullPath); err != nil {
+				log.Printf("Error creating PDF: %v", err)
+				return
+			}
+
+			if err := addTicketData(eventID, hashStr, url); err != nil {
+				log.Printf("Error adding ticket data: %v", err)
+				return
+			}
+
+			attachments = append(attachments, fileName)
+		}(i)
+	}
+
+	wg.Wait()
+
 	return attachments, nil
 }
 
-func addQRCodeToPDF(pdf *gofpdf.Fpdf, i int, url string, email string, eventID string) {
-
+func addQRCodeToPDF(pdf *gofpdf.Fpdf, i int, url string, email string, eventName string, venue string, date string) {
 	qrCode, err := qrcode.New(url, qrcode.Medium)
 	if err != nil {
-		fmt.Println("Error generating QR code:", err)
+		log.Println("Error generating QR code:", err)
 		return
 	}
 
 	var qrCodeBuffer bytes.Buffer
 	if err := qrCode.Write(256, &qrCodeBuffer); err != nil {
-		fmt.Println("Error writing QR code to buffer:", err)
+		log.Println("Error writing QR code to buffer:", err)
 		return
 	}
 
 	pdf.AddPage()
+
+	// Draw a header background
+	pdf.SetFillColor(40, 12, 166)  // Cornflower blue for header background
+	pdf.Rect(10, 10, 190, 30, "F") // Full-width rectangle for the header
+
+	// Set title with bold, large font and centered
+	pdf.SetFont("Arial", "B", 32)
+	pdf.SetTextColor(255, 255, 255) // White for title text
+	pdf.SetXY(10, 15)
+	pdf.CellFormat(190, 25, "2ende", "", 0, "C", false, 0, "")
+
+	// Add the QR code with a smaller size and rounded border
 	pdf.RegisterImageOptionsReader(fmt.Sprintf("qr%d", i), gofpdf.ImageOptions{ImageType: "png"}, &qrCodeBuffer)
+	pdf.SetDrawColor(100, 149, 237) // Border color matches header
+	pdf.SetLineWidth(1)
+	pdf.RoundedRect(15, 50, 70, 70, 5, "D", "1234") // Rounded border for the QR code
+	pdf.ImageOptions(fmt.Sprintf("qr%d", i), 20, 55, 60, 60, false, gofpdf.ImageOptions{ImageType: "png"}, 0, "")
 
-	pdf.ImageOptions(fmt.Sprintf("qr%d", i), 50, 50, 100, 100, false, gofpdf.ImageOptions{ImageType: "png"}, 0, "")
+	// Draw an information section border of the same size as the QR code
+	pdf.SetDrawColor(100, 149, 237) // Matching border color
+	pdf.SetLineWidth(1)
+	pdf.RoundedRect(90, 50, 110, 70, 5, "D", "1234") // Rounded border for ticket details
 
-	// Add text below the QR code
-
-	// Add "Your Ticket" button
-	pdf.SetFont("Arial", "", 28)
-	pdf.SetTextColor(0, 0, 0)
-	pdf.SetXY(80, 25)
-	pdf.Cell(100, 10, "Your Ticket")
-
-	// Add ticket details
+	// Ticket details with improved padding and font styles
 	pdf.SetFont("Arial", "", 16)
-	pdf.SetTextColor(0, 0, 0)
-	pdf.SetXY(50, 150)
-	pdf.Cell(100, 10, fmt.Sprintf("Event: %s", eventID))
-	pdf.SetXY(50, 160)
-	pdf.Cell(100, 10, fmt.Sprintf("Email: %s", email))
+	pdf.SetTextColor(50, 50, 50) // Dark gray for text
 
-	pdf.SetXY(50, 170)
-	pdf.Cell(100, 10, "Ticket: REGULAR")
+	pdf.SetXY(95, 55)
+	pdf.Cell(60, 10, fmt.Sprintf("Event: %s", eventName))
 
-	pdf.SetXY(50, 180)
-	pdf.Cell(100, 10, "Location: KICC, Parliament Road, Nairobi, Kenya")
+	pdf.SetXY(95, 65)
+	pdf.Cell(60, 10, fmt.Sprintf("Email: %s", email))
 
-	pdf.SetXY(50, 190)
-	pdf.Cell(100, 10, "Date & Time: N/A")
+	pdf.SetXY(95, 75)
+	pdf.Cell(60, 10, "Ticket: REGULAR")
 
-	pdf.SetFont("Arial", "", 14)
-	pdf.SetTextColor(0, 0, 0)
-	// pdf.SetXY(25, 200)
-	// pdf.Cell(100, 10, "Code")
-	pdf.SetXY(25, 205)
-	pdf.Cell(50, 10, url)
+	pdf.SetXY(95, 85)
+	pdf.Cell(60, 10, fmt.Sprintf("Location: %s", venue))
+
+	pdf.SetXY(95, 95)
+	pdf.Cell(60, 10, fmt.Sprintf("Date: %s", date))
+
+	// Add the URL with a modern link style
+	pdf.SetFont("Arial", "I", 14)
+	pdf.SetTextColor(11, 135, 34) // Blue for the URL
+	pdf.SetXY(15, 130)
+	pdf.CellFormat(180, 10, url, "", 0, "C", false, 0, "")
+
+	// Add a footer line with a modern touch
+	pdf.SetDrawColor(230, 230, 230) // Light gray
+	pdf.SetLineWidth(0.5)
+	pdf.Line(10, 145, 200, 145) // Thin, decorative line for footer
+
 }
-
-// func sendEmailWithAttachments(receiverEmail, subject, body string, attachments []string) error {
-// 	const (
-// 		senderEmail  = "MS_YNKJNo@trial-neqvygm85w840p7w.mlsender.net"
-// 		smtpServer   = "smtp.mailersend.net"
-// 		smtpPort     = "587"
-// 		smtpPassword = "IY7lWUfg260dD6hR"
-// 	)
-
-// 	auth := smtp.PlainAuth("", senderEmail, smtpPassword, smtpServer)
-// 	boundary := fmt.Sprintf("----%x", rand.Int63n(10000000000))
-
-// 	msg := bytes.NewBuffer(nil)
-// 	msg.WriteString("MIME-Version: 1.0\r\n")
-// 	msg.WriteString(fmt.Sprintf("To: %s\r\n", receiverEmail))
-// 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
-// 	msg.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=%s\r\n", boundary))
-// 	msg.WriteString("\r\n--" + boundary + "\r\n")
-// 	msg.WriteString("Content-Type: text/plain; charset=utf-8\r\n\r\n" + body + "\r\n")
-
-// 	for _, attachment := range attachments {
-// 		if err := addAttachment(msg, attachment, boundary); err != nil {
-// 			fmt.Println("Error adding attachment:", err)
-// 			return err
-// 		}
-// 	}
-
-// 	msg.WriteString("\r\n--" + boundary + "--\r\n")
-
-// 	err := smtp.SendMail(smtpServer+":"+smtpPort, auth, senderEmail, []string{receiverEmail}, msg.Bytes())
-// 	if err != nil {
-// 		return err
-// 	}
-// 	fmt.Println("Email sent successfully!")
-// 	return nil
-// }
 
 func sendEmailWithAttachments(receiverEmail, subject, body string, attachments []string) error {
 	const (
@@ -198,23 +276,23 @@ func sendEmailWithAttachments(receiverEmail, subject, body string, attachments [
 	msg.WriteString("Content-Type: text/plain; charset=utf-8\r\n\r\n" + body + "\r\n")
 
 	for _, attachment := range attachments {
-		if err := addAttachment(msg, attachment, boundary); err != nil {
-			fmt.Println("Error adding attachment:", err)
+		attachmentPath := filepath.Join("/src/output", attachment)
+		if err := addAttachment(msg, attachmentPath, boundary); err != nil {
+			log.Printf("Error adding attachment: %v", err)
 			return err
 		}
-		// Delete the attachment after adding it to the email message
-		if err := os.Remove(attachment); err != nil {
-			fmt.Printf("Warning: failed to delete file %s: %v\n", attachment, err)
+		if err := os.Remove(attachmentPath); err != nil {
+			log.Printf("Warning: failed to delete file %s: %v", attachment, err)
 		}
 	}
 
 	msg.WriteString("\r\n--" + boundary + "--\r\n")
-
 	err := smtp.SendMail(smtpServer+":"+smtpPort, auth, senderEmail, []string{receiverEmail}, msg.Bytes())
 	if err != nil {
+		log.Printf("Error sending email: %v", err)
 		return err
 	}
-	fmt.Println("Email sent successfully!")
+	log.Println("Email sent successfully!")
 	return nil
 }
 
@@ -247,6 +325,5 @@ func addAttachment(msg *bytes.Buffer, attachmentPath, boundary string) error {
 			return fmt.Errorf("error encoding attachment: %w", err)
 		}
 	}
-
 	return nil
 }
