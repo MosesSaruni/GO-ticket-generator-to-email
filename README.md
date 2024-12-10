@@ -1,12 +1,12 @@
-# 📄 2wende QR Code Ticket Generator and Email Sender
+# 📄 2ende QR Code Ticket Generator and Email Sender
 
-## 🎉 About 2wende  
-2wende is an innovative ticketing platform dedicated to streamlining event ticket distribution through secure, digital solutions.
+## 🎉 About 2ende  
+2ende is an innovative ticketing platform dedicated to streamlining event ticket distribution through secure, digital solutions.
 
 ---
 
 ## ✨ Overview  
-This Go-based application is designed to enhance 2wende's ticketing operations by generating QR code tickets, converting them into PDFs, and sending them directly to customers via email.
+This Go-based application is designed to enhance 2ende's ticketing operations by generating QR code tickets, converting them into PDFs, and sending them directly to customers via email.
 
 ---
 
